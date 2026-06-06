@@ -1,0 +1,3 @@
+# MockPlugin
+
+::: tripwire.MockPlugin

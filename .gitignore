@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Mypy
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Distribution
+*.tar.gz
+*.zip
+
+# Hatch
+.hatch/
+
+# Coverage reports
+coverage.json
+coverage.xml
+
+# Logs
+logs/
+
+# MkDocs build output
+site/
+
+# Git worktrees
+.worktrees/
+
+# uv lock file (library, not application)
+uv.lock

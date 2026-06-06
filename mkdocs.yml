@@ -1,0 +1,151 @@
+site_name: tripwire
+site_description: "Full-certainty test mocking for Python."
+site_url: https://axiomantic.github.io/tripwire/
+repo_url: https://github.com/axiomantic/pytest-tripwire
+repo_name: axiomantic/pytest-tripwire
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            merge_init_into_class: true
+            show_if_no_docstring: false
+            signature_crossrefs: true
+            separate_signature: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+  - pymdownx.snippets:
+      base_path: ["."]
+  - attr_list
+  - md_in_html
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: guides/installation.md
+    - Quick Start: guides/quickstart.md
+  - Guides:
+    - MockPlugin: guides/mock-plugin.md
+    - HttpPlugin: guides/http-plugin.md
+    - SubprocessPlugin: guides/subprocess-plugin.md
+    - LoggingPlugin: guides/logging-plugin.md
+    - PopenPlugin: guides/popen-plugin.md
+    - AsyncSubprocessPlugin: guides/async-subprocess-plugin.md
+    - DatabasePlugin: guides/database-plugin.md
+    - Psycopg2Plugin: guides/psycopg2-plugin.md
+    - AsyncpgPlugin: guides/asyncpg-plugin.md
+    - SmtpPlugin: guides/smtp-plugin.md
+    - SocketPlugin: guides/socket-plugin.md
+    - RedisPlugin: guides/redis-plugin.md
+    - MemcachePlugin: guides/memcache-plugin.md
+    - MongoPlugin: guides/mongo-plugin.md
+    - ElasticsearchPlugin: guides/elasticsearch-plugin.md
+    - Boto3Plugin: guides/boto3-plugin.md
+    - CeleryPlugin: guides/celery-plugin.md
+    - PikaPlugin: guides/pika-plugin.md
+    - SshPlugin: guides/ssh-plugin.md
+    - GrpcPlugin: guides/grpc-plugin.md
+    - DnsPlugin: guides/dns-plugin.md
+    - JwtPlugin: guides/jwt-plugin.md
+    - CryptoPlugin: guides/crypto-plugin.md
+    - FileIoPlugin: guides/file-io-plugin.md
+    - NativePlugin: guides/native-plugin.md
+    - WebSocket Plugins: guides/websocket-plugin.md
+    - Stateful Plugins: guides/stateful-plugins.md
+    - Configuration: guides/configuration.md
+    - Async Usage: guides/async.md
+    - pytest Integration: guides/pytest-integration.md
+    - McpPlugin: guides/mcp-plugin.md
+    - Writing Plugins: guides/writing-plugins.md
+    - Guard Mode: guides/guard-mode.md
+    - Threading: guides/threading.md
+    - How It Works: guides/how-it-works.md
+    - Plugin Layers: guides/plugin-layers.md
+  - API Reference:
+    - Overview: reference/index.md
+    - StrictVerifier: reference/verifier.md
+    - MockPlugin: reference/mock-plugin.md
+    - HttpPlugin: reference/http-plugin.md
+    - SubprocessPlugin: reference/subprocess-plugin.md
+    - LoggingPlugin: reference/logging-plugin.md
+    - PopenPlugin: reference/popen-plugin.md
+    - AsyncSubprocessPlugin: reference/async-subprocess-plugin.md
+    - DatabasePlugin: reference/database-plugin.md
+    - Psycopg2Plugin: reference/psycopg2-plugin.md
+    - AsyncpgPlugin: reference/asyncpg-plugin.md
+    - SmtpPlugin: reference/smtp-plugin.md
+    - SocketPlugin: reference/socket-plugin.md
+    - RedisPlugin: reference/redis-plugin.md
+    - MemcachePlugin: reference/memcache-plugin.md
+    - MongoPlugin: reference/mongo-plugin.md
+    - ElasticsearchPlugin: reference/elasticsearch-plugin.md
+    - Boto3Plugin: reference/boto3-plugin.md
+    - CeleryPlugin: reference/celery-plugin.md
+    - PikaPlugin: reference/pika-plugin.md
+    - SshPlugin: reference/ssh-plugin.md
+    - GrpcPlugin: reference/grpc-plugin.md
+    - DnsPlugin: reference/dns-plugin.md
+    - JwtPlugin: reference/jwt-plugin.md
+    - CryptoPlugin: reference/crypto-plugin.md
+    - FileIoPlugin: reference/file-io-plugin.md
+    - NativePlugin: reference/native-plugin.md
+    - WebSocket Plugins: reference/websocket-plugin.md
+    - McpPlugin: reference/mcp-plugin.md
+    - Configuration: reference/configuration.md
+    - Errors: reference/errors.md
+
+extra:
+  version:
+    provider: mike
+    default: latest

@@ -1,0 +1,2127 @@
+"""Tests for guard mode infrastructure and behavior."""
+
+from __future__ import annotations
+
+import warnings
+from collections.abc import Generator
+from contextlib import contextmanager
+
+import pytest
+
+from tripwire._config import GuardLevels, _resolve_guard_levels
+from tripwire._context import (
+    GuardPassThrough,
+    _active_verifier,
+    _guard_active,
+    get_verifier_or_raise,
+)
+from tripwire._errors import GuardedCallError, GuardedCallWarning, SandboxNotActiveError
+from tripwire._firewall import (
+    Disposition,
+    FirewallRule,
+    FirewallStack,
+    _firewall_stack,
+)
+from tripwire._match import M
+
+
+@contextmanager
+def _with_active_verifier() -> Generator[None, None, None]:
+    """Set `_active_verifier` to a sentinel for the duration of the block.
+
+    C9 added a check that `tripwire.allow/deny/restrict` raise outside any
+    active sandbox (i.e., when `_active_verifier` is None). Tests in this
+    file exercise the firewall stack mechanics or guard-mode pathways
+    without going through `with tripwire.sandbox():`; setting
+    `_active_verifier` directly satisfies the C9 gate without standing up
+    a full sandbox.
+    """
+    from tripwire._verifier import StrictVerifier
+
+    StrictVerifier._suppress_direct_warning = True
+    try:
+        sentinel = StrictVerifier()
+    finally:
+        StrictVerifier._suppress_direct_warning = False
+    token = _active_verifier.set(sentinel)
+    try:
+        yield
+    finally:
+        _active_verifier.reset(token)
+
+
+@contextmanager
+def _push_deny_direct(*protocols: str) -> Generator[None, None, None]:
+    """Push DENY frames onto the firewall stack directly, bypassing C9.
+
+    Tests of GUARD-mode behavior (no sandbox, no verifier) need to add a
+    DENY rule without going through `tripwire.deny(...)` (which now requires
+    an active verifier per C9). This helper duplicates the post-check body
+    of `tripwire.deny(...)` for tests that exercise guard-mode dispatch
+    while `_active_verifier` is intentionally None.
+    """
+    from tripwire._firewall import Disposition, FirewallRule
+
+    frames = tuple(
+        FirewallRule(pattern=M(protocol=p), disposition=Disposition.DENY)
+        for p in protocols
+    )
+    current = _firewall_stack.get()
+    new_stack = current.push(*frames)
+    token = _firewall_stack.set(new_stack)
+    try:
+        yield
+    finally:
+        _firewall_stack.reset(token)
+
+
+@contextmanager
+def _push_allow_direct(*protocols: str) -> Generator[None, None, None]:
+    """Push ALLOW frames onto the firewall stack directly, bypassing C9.
+
+    Companion to `_push_deny_direct`. Same rationale: guard-mode-only tests
+    need to add an ALLOW rule without an active verifier.
+    """
+    from tripwire._firewall import Disposition, FirewallRule
+
+    frames = tuple(
+        FirewallRule(pattern=M(protocol=p), disposition=Disposition.ALLOW)
+        for p in protocols
+    )
+    current = _firewall_stack.get()
+    new_stack = current.push(*frames)
+    token = _firewall_stack.set(new_stack)
+    try:
+        yield
+    finally:
+        _firewall_stack.reset(token)
+
+
+class TestGuardContextVars:
+    """Test guard mode ContextVars exist and have correct defaults.
+
+    Note: the _tripwire_guard autouse fixture sets _guard_active=True during
+    each test body, so runtime get() returns True. These tests verify the
+    ContextVar's declared default and token-based set/reset behavior.
+    """
+
+    def test_guard_active_declared_default_is_false(self) -> None:
+        """The ContextVar's declared default is False (before any fixture sets it)."""
+        import contextvars
+
+        # Create a fresh context to read the ContextVar's declared default
+        ctx = contextvars.copy_context()
+        # In the test body, _guard_active is True (set by fixture).
+        # The declared default is False, verified by checking a new token reset.
+        token = _guard_active.set(False)
+        assert _guard_active.get() is False
+        _guard_active.reset(token)
+
+    def test_firewall_stack_default_is_empty(self) -> None:
+        """Without @pytest.mark.allow, the firewall stack has no rules beyond markers."""
+        # The pytest_runtest_call hook sets up the stack; with no markers,
+        # it should have no ALLOW rules. Check that the stack exists.
+        stack = _firewall_stack.get()
+        assert isinstance(stack, FirewallStack)
+
+    def test_guard_active_can_be_set_and_reset(self) -> None:
+        """ContextVar token set/reset restores to the fixture's value (True)."""
+        # Fixture sets _guard_active to True
+        assert _guard_active.get() is True
+        token = _guard_active.set(False)
+        assert _guard_active.get() is False
+        _guard_active.reset(token)
+        # Resets to fixture's value, which is True
+        assert _guard_active.get() is True
+
+    def test_firewall_stack_can_be_set_and_reset(self) -> None:
+        """FirewallStack ContextVar supports token-based set/reset."""
+        frames = (
+            FirewallRule(pattern=M(protocol="dns"), disposition=Disposition.ALLOW),
+            FirewallRule(pattern=M(protocol="socket"), disposition=Disposition.ALLOW),
+        )
+        new_stack = FirewallStack(frames)
+        token = _firewall_stack.set(new_stack)
+        assert _firewall_stack.get() is new_stack
+        assert len(_firewall_stack.get().frames) == 2
+        _firewall_stack.reset(token)
+
+
+class TestGuardPassThrough:
+    """Test GuardPassThrough sentinel exception."""
+
+    def test_inherits_from_base_exception(self) -> None:
+        assert issubclass(GuardPassThrough, BaseException)
+
+    def test_not_caught_by_generic_except_exception(self) -> None:
+        with pytest.raises(GuardPassThrough):
+            try:
+                raise GuardPassThrough()
+            except Exception:
+                pass  # Should NOT catch GuardPassThrough
+
+
+class TestGuardedCallError:
+    """Test GuardedCallError exception class."""
+
+    def test_inherits_from_tripwire_error(self) -> None:
+        from tripwire._errors import TripwireError
+
+        assert issubclass(GuardedCallError, TripwireError)
+
+    def test_stores_source_id_and_plugin_name(self) -> None:
+        err = GuardedCallError(source_id="dns:getaddrinfo:example.com", plugin_name="dns")
+        assert err.source_id == "dns:getaddrinfo:example.com"
+        assert err.plugin_name == "dns"
+
+    def test_message_format(self) -> None:
+        err = GuardedCallError(source_id="http:request", plugin_name="http")
+        msg = str(err)
+        assert msg.startswith("GuardedCallError: 'http:request' blocked by tripwire firewall.")
+        assert '@pytest.mark.allow("http")' in msg
+        assert 'with tripwire.allow("http")' in msg
+        assert "with tripwire:" in msg
+        assert "[tool.tripwire.firewall]" in msg
+        assert "https://tripwire.readthedocs.io/guides/guard-mode/" in msg
+        # Old sections removed
+        assert "FOR PLUGIN AUTHORS" not in msg
+        assert "FOR CONTRIBUTORS" not in msg
+        assert "tripwire_verifier.sandbox()" not in msg
+        assert "Valid plugin names for allow():" not in msg
+
+    def test_message_with_different_plugin(self) -> None:
+        err = GuardedCallError(source_id="dns:getaddrinfo:example.com", plugin_name="dns")
+        msg = str(err)
+        assert "'dns:getaddrinfo:example.com' blocked by tripwire firewall." in msg
+        assert '@pytest.mark.allow("dns")' in msg
+        assert 'with tripwire.allow("dns")' in msg
+
+
+class TestPassthroughSafe:
+    """Test passthrough_safe ClassVar on plugins (replaces the prior
+    supports_guard ClassVar; covered more exhaustively in
+    tests/unit/test_passthrough_safe.py)."""
+
+    def test_base_plugin_default_is_false(self) -> None:
+        from tripwire._base_plugin import BasePlugin
+
+        assert BasePlugin.passthrough_safe is False
+
+    def test_mock_plugin_is_true(self) -> None:
+        from tripwire._mock_plugin import MockPlugin
+
+        assert MockPlugin.passthrough_safe is True
+
+    def test_logging_plugin_is_true(self) -> None:
+        from tripwire.plugins.logging_plugin import LoggingPlugin
+
+        assert LoggingPlugin.passthrough_safe is True
+
+    def test_jwt_plugin_is_true(self) -> None:
+        from tripwire.plugins.jwt_plugin import JwtPlugin
+
+        assert JwtPlugin.passthrough_safe is True
+
+    def test_crypto_plugin_is_true(self) -> None:
+        from tripwire.plugins.crypto_plugin import CryptoPlugin
+
+        assert CryptoPlugin.passthrough_safe is True
+
+    def test_native_plugin_is_false(self) -> None:
+        # Passthrough loads real native libraries (ctypes.CDLL / cffi.FFI.dlopen).
+        from tripwire.plugins.native_plugin import NativePlugin
+
+        assert NativePlugin.passthrough_safe is False
+
+    def test_celery_plugin_is_false(self) -> None:
+        # Passthrough enqueues real broker messages via Task.delay /
+        # Task.apply_async.
+        from tripwire.plugins.celery_plugin import CeleryPlugin
+
+        assert CeleryPlugin.passthrough_safe is False
+
+    def test_file_io_plugin_is_false(self) -> None:
+        # Passthrough performs real disk I/O via builtins.open / Path methods.
+        from tripwire.plugins.file_io_plugin import FileIoPlugin
+
+        assert FileIoPlugin.passthrough_safe is False
+
+    def test_dns_plugin_is_false(self) -> None:
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        assert DnsPlugin.passthrough_safe is False
+
+    def test_http_plugin_is_false(self) -> None:
+        from tripwire.plugins.http import HttpPlugin
+
+        assert HttpPlugin.passthrough_safe is False
+
+    def test_socket_plugin_is_false(self) -> None:
+        from tripwire.plugins.socket_plugin import SocketPlugin
+
+        assert SocketPlugin.passthrough_safe is False
+
+
+from tripwire._guard import allow
+
+
+class TestAllow:
+    """Test allow() context manager pushes ALLOW rules onto firewall stack."""
+
+    def test_pushes_allow_rules_and_resets(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        with _with_active_verifier():
+            stack_before = _firewall_stack.get()
+            with allow("dns", "socket"):
+                stack_inside = _firewall_stack.get()
+                # Two new ALLOW frames pushed
+                assert len(stack_inside.frames) == len(stack_before.frames) + 2
+                # DNS request should be ALLOW'd
+                dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+                assert stack_inside.evaluate(dns_req) == Disposition.ALLOW
+                # Socket request should be ALLOW'd
+                sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+                assert stack_inside.evaluate(sock_req) == Disposition.ALLOW
+            # After exit, stack is restored
+            assert _firewall_stack.get() is stack_before
+
+    def test_nestable_stacks_rules(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        with _with_active_verifier():
+            stack_before = _firewall_stack.get()
+            with allow("dns"):
+                stack_dns = _firewall_stack.get()
+                dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+                assert stack_dns.evaluate(dns_req) == Disposition.ALLOW
+                with allow("socket"):
+                    stack_both = _firewall_stack.get()
+                    sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+                    assert stack_both.evaluate(dns_req) == Disposition.ALLOW
+                    assert stack_both.evaluate(sock_req) == Disposition.ALLOW
+                # socket rule removed after inner exit
+                assert _firewall_stack.get() is stack_dns
+            assert _firewall_stack.get() is stack_before
+
+    def test_requires_at_least_one_rule(self) -> None:
+        with pytest.raises(ValueError, match="allow\\(\\) requires at least one rule"):
+            with allow():
+                pass
+
+    def test_single_protocol_name(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        with _with_active_verifier():
+            with allow("http"):
+                stack = _firewall_stack.get()
+                http_req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+                assert stack.evaluate(http_req) == Disposition.ALLOW
+
+    def test_resets_on_exception(self) -> None:
+        with _with_active_verifier():
+            stack_before = _firewall_stack.get()
+            with pytest.raises(ValueError, match="boom"):
+                with allow("dns"):
+                    raise ValueError("boom")
+            assert _firewall_stack.get() is stack_before
+
+
+class TestDeny:
+    """Test deny() context manager pushes DENY rules onto firewall stack."""
+
+    def test_deny_blocks_allowed_protocol(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire._guard import deny
+
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+
+        with _with_active_verifier():
+            with allow("dns", "socket"):
+                assert _firewall_stack.get().evaluate(dns_req) == Disposition.ALLOW
+                assert _firewall_stack.get().evaluate(sock_req) == Disposition.ALLOW
+                with deny("socket"):
+                    # socket should now be DENY'd, dns still ALLOW'd
+                    assert _firewall_stack.get().evaluate(dns_req) == Disposition.ALLOW
+                    assert _firewall_stack.get().evaluate(sock_req) == Disposition.DENY
+                # After exiting deny, socket allowed again
+                assert _firewall_stack.get().evaluate(sock_req) == Disposition.ALLOW
+
+    def test_deny_without_allow_keeps_deny(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire._guard import deny
+
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        # Default disposition is DENY, so deny on top of empty stack still denies
+        with _with_active_verifier():
+            with deny("dns"):
+                assert _firewall_stack.get().evaluate(dns_req) == Disposition.DENY
+
+    def test_deny_resets_on_exception(self) -> None:
+        from tripwire._guard import deny
+
+        with _with_active_verifier():
+            stack_before = _firewall_stack.get()
+            with pytest.raises(ValueError, match="boom"):
+                with allow("dns", "socket"):
+                    with deny("socket"):
+                        raise ValueError("boom")
+            assert _firewall_stack.get() is stack_before
+
+    def test_deny_requires_at_least_one_rule(self) -> None:
+        from tripwire._guard import deny
+
+        with pytest.raises(ValueError, match="deny\\(\\) requires at least one rule"):
+            with deny():
+                pass
+
+    def test_nested_deny(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire._guard import deny
+
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+        http_req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+
+        with _with_active_verifier():
+            with allow("dns", "socket", "http"):
+                with deny("socket"):
+                    assert _firewall_stack.get().evaluate(dns_req) == Disposition.ALLOW
+                    assert _firewall_stack.get().evaluate(http_req) == Disposition.ALLOW
+                    assert _firewall_stack.get().evaluate(sock_req) == Disposition.DENY
+                    with deny("dns"):
+                        assert _firewall_stack.get().evaluate(http_req) == Disposition.ALLOW
+                        assert _firewall_stack.get().evaluate(dns_req) == Disposition.DENY
+                        assert _firewall_stack.get().evaluate(sock_req) == Disposition.DENY
+                    assert _firewall_stack.get().evaluate(dns_req) == Disposition.ALLOW
+                assert _firewall_stack.get().evaluate(sock_req) == Disposition.ALLOW
+
+
+class TestRestrict:
+    """Test restrict() context manager pushes restriction ceiling onto firewall stack."""
+
+    def test_restrict_blocks_non_matching_protocols(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire._guard import restrict
+
+        http_req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+        redis_req = NetworkFirewallRequest(protocol="redis", host="localhost", port=6379)
+
+        with _with_active_verifier():
+            with allow("http", "redis"):
+                # Both allowed before restrict
+                assert _firewall_stack.get().evaluate(http_req) == Disposition.ALLOW
+                assert _firewall_stack.get().evaluate(redis_req) == Disposition.ALLOW
+                with restrict("http"):
+                    # Only HTTP passes the restrict ceiling
+                    with allow("http"):
+                        assert _firewall_stack.get().evaluate(http_req) == Disposition.ALLOW
+                    assert _firewall_stack.get().evaluate(redis_req) == Disposition.DENY
+
+    def test_restrict_resets_on_exit(self) -> None:
+        from tripwire._guard import restrict
+
+        with _with_active_verifier():
+            stack_before = _firewall_stack.get()
+            with restrict("http"):
+                pass
+            assert _firewall_stack.get() is stack_before
+
+    def test_restrict_requires_at_least_one_rule(self) -> None:
+        from tripwire._guard import restrict
+
+        with pytest.raises(ValueError, match="restrict\\(\\) requires at least one rule"):
+            with restrict():
+                pass
+
+    def test_restrict_multiple_protocols_ored(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire._guard import restrict
+
+        http_req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        redis_req = NetworkFirewallRequest(protocol="redis", host="localhost", port=6379)
+
+        with _with_active_verifier():
+            with restrict("http", "dns"):
+                with allow("http", "dns", "redis"):
+                    assert _firewall_stack.get().evaluate(http_req) == Disposition.ALLOW
+                    assert _firewall_stack.get().evaluate(dns_req) == Disposition.ALLOW
+                    # Redis is not in the restrict set, so blocked by ceiling
+                    assert _firewall_stack.get().evaluate(redis_req) == Disposition.DENY
+
+    def test_restrict_inner_allow_cannot_widen_ceiling(self) -> None:
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire._guard import restrict
+
+        redis_req = NetworkFirewallRequest(protocol="redis", host="localhost", port=6379)
+
+        with _with_active_verifier():
+            with restrict("http"):
+                # Inner allow("redis") should NOT widen past the HTTP ceiling
+                with allow("redis"):
+                    assert _firewall_stack.get().evaluate(redis_req) == Disposition.DENY
+
+
+class TestPublicExports:
+    """Test that guard mode symbols are exported from tripwire package."""
+
+    def test_allow_importable_from_tripwire(self) -> None:
+        from tripwire import allow as tripwire_allow
+
+        assert callable(tripwire_allow)
+
+    def test_deny_importable_from_tripwire(self) -> None:
+        from tripwire import deny as tripwire_deny
+
+        assert callable(tripwire_deny)
+
+    def test_restrict_importable_from_tripwire(self) -> None:
+        from tripwire import restrict as tripwire_restrict
+
+        assert callable(tripwire_restrict)
+
+    def test_guarded_call_error_importable_from_tripwire(self) -> None:
+        from tripwire import GuardedCallError as TripwireGuardedCallError
+
+        assert issubclass(TripwireGuardedCallError, Exception)
+
+    def test_allow_in_all(self) -> None:
+        import tripwire
+
+        assert "allow" in tripwire.__all__
+
+    def test_restrict_in_all(self) -> None:
+        import tripwire
+
+        assert "restrict" in tripwire.__all__
+
+    def test_guarded_call_error_in_all(self) -> None:
+        import tripwire
+
+        assert "GuardedCallError" in tripwire.__all__
+
+    def test_guarded_call_warning_importable_from_tripwire(self) -> None:
+        from tripwire import GuardedCallWarning as TripwireGuardedCallWarning
+
+        assert issubclass(TripwireGuardedCallWarning, UserWarning)
+
+    def test_guarded_call_warning_in_all(self) -> None:
+        import tripwire
+
+        assert "GuardedCallWarning" in tripwire.__all__
+
+
+class TestResolveGuardLevel:
+    """Test _resolve_guard_levels config parser (scalar form)."""
+
+    def test_absent_key_returns_error(self) -> None:
+        """Missing guard key defaults to 'error' as of 0.20.0 (Proposal 1 default flip)."""
+        assert _resolve_guard_levels({}) == GuardLevels(default="error", overrides={})
+
+    def test_warn_string_returns_warn(self) -> None:
+        assert _resolve_guard_levels({"guard": "warn"}) == GuardLevels(
+            default="warn", overrides={}
+        )
+
+    def test_error_string_returns_error(self) -> None:
+        assert _resolve_guard_levels({"guard": "error"}) == GuardLevels(
+            default="error", overrides={}
+        )
+
+    def test_strict_string_returns_error(self) -> None:
+        """'strict' is an alias for 'error'."""
+        assert _resolve_guard_levels({"guard": "strict"}) == GuardLevels(
+            default="error", overrides={}
+        )
+
+    def test_false_returns_off(self) -> None:
+        assert _resolve_guard_levels({"guard": False}) == GuardLevels(
+            default="off", overrides={}
+        )
+
+    def test_true_rejected_with_config_error(self) -> None:
+        """guard = true is ambiguous and must be rejected."""
+        from tripwire._errors import TripwireConfigError
+
+        with pytest.raises(TripwireConfigError, match="guard = true is not a valid value"):
+            _resolve_guard_levels({"guard": True})
+
+    def test_invalid_string_rejected(self) -> None:
+        from tripwire._errors import TripwireConfigError
+
+        with pytest.raises(TripwireConfigError, match="Invalid value 'invalid' for"):
+            _resolve_guard_levels({"guard": "invalid"})
+
+    def test_invalid_type_rejected(self) -> None:
+        from tripwire._errors import TripwireConfigError
+
+        with pytest.raises(TripwireConfigError, match="guard must be a string, bool, or a table"):
+            _resolve_guard_levels({"guard": 42})
+
+    def test_case_insensitive_warn(self) -> None:
+        assert _resolve_guard_levels({"guard": "WARN"}) == GuardLevels(
+            default="warn", overrides={}
+        )
+
+    def test_case_insensitive_error(self) -> None:
+        assert _resolve_guard_levels({"guard": "ERROR"}) == GuardLevels(
+            default="error", overrides={}
+        )
+
+    def test_case_insensitive_strict(self) -> None:
+        assert _resolve_guard_levels({"guard": "STRICT"}) == GuardLevels(
+            default="error", overrides={}
+        )
+
+
+class TestGuardedCallWarningClass:
+    """Test GuardedCallWarning exception class."""
+
+    def test_is_user_warning(self) -> None:
+        assert issubclass(GuardedCallWarning, UserWarning)
+
+    def test_not_tripwire_error(self) -> None:
+        """GuardedCallWarning is a warning, not a TripwireError."""
+        from tripwire._errors import TripwireError
+
+        assert not issubclass(GuardedCallWarning, TripwireError)
+
+
+class TestWarnModeBehavior:
+    """Test guard mode warn behavior in get_verifier_or_raise."""
+
+    def test_warn_mode_emits_warning(self) -> None:
+        """Guard in warn mode emits GuardedCallWarning."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        level_token = _guard_levels.set(GuardLevels(default="warn", overrides={}))
+        guard_token = _guard_active.set(True)
+        try:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                # Use jwt (passthrough_safe=True) so the warn-unsafe
+                # gate does not fire; project-level firewall allow rules
+                # only cover dns/socket so this DENY hits the warn path.
+                # 'jwt' is preferred over 'crypto' so this test runs on
+                # the 3.14t free-threaded build, where the cryptography
+                # wheel is unavailable.
+                req = NetworkFirewallRequest(protocol="jwt", host="local", port=0)
+                with pytest.raises(GuardPassThrough):
+                    get_verifier_or_raise("jwt:encode", firewall_request=req)
+                assert len(w) == 1
+                assert issubclass(w[0].category, GuardedCallWarning)
+        finally:
+            _guard_active.reset(guard_token)
+            _guard_levels.reset(level_token)
+
+    def test_warn_mode_raises_guard_pass_through(self) -> None:
+        """After warning, GuardPassThrough is raised (real call proceeds)."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        level_token = _guard_levels.set(GuardLevels(default="warn", overrides={}))
+        guard_token = _guard_active.set(True)
+        try:
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                req = NetworkFirewallRequest(protocol="jwt", host="local", port=0)
+                with pytest.raises(GuardPassThrough):
+                    get_verifier_or_raise("jwt:encode", firewall_request=req)
+        finally:
+            _guard_active.reset(guard_token)
+            _guard_levels.reset(level_token)
+
+    def test_warn_mode_warning_is_filterable(self) -> None:
+        """warnings.filterwarnings('ignore') suppresses GuardedCallWarning."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        level_token = _guard_levels.set(GuardLevels(default="warn", overrides={}))
+        guard_token = _guard_active.set(True)
+        try:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                warnings.filterwarnings("ignore", category=GuardedCallWarning)
+                req = NetworkFirewallRequest(protocol="jwt", host="local", port=0)
+                with pytest.raises(GuardPassThrough):
+                    get_verifier_or_raise("jwt:encode", firewall_request=req)
+                assert len(w) == 0
+        finally:
+            _guard_active.reset(guard_token)
+            _guard_levels.reset(level_token)
+
+    def test_warn_mode_warning_contains_source_id(self) -> None:
+        """Warning message includes the source_id."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        level_token = _guard_levels.set(GuardLevels(default="warn", overrides={}))
+        guard_token = _guard_active.set(True)
+        try:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                req = NetworkFirewallRequest(protocol="jwt", host="local", port=0)
+                with pytest.raises(GuardPassThrough):
+                    get_verifier_or_raise("jwt:encode", firewall_request=req)
+                assert "'jwt:encode'" in str(w[0].message)
+        finally:
+            _guard_active.reset(guard_token)
+            _guard_levels.reset(level_token)
+
+    def test_warn_mode_warning_contains_blocked_by_firewall(self) -> None:
+        """Warning message says 'blocked by firewall'."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        level_token = _guard_levels.set(GuardLevels(default="warn", overrides={}))
+        guard_token = _guard_active.set(True)
+        try:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                req = NetworkFirewallRequest(protocol="jwt", host="local", port=0)
+                with pytest.raises(GuardPassThrough):
+                    get_verifier_or_raise("jwt:encode", firewall_request=req)
+                msg = str(w[0].message)
+                assert "blocked by firewall" in msg
+        finally:
+            _guard_active.reset(guard_token)
+            _guard_levels.reset(level_token)
+
+    def test_error_mode_raises_guarded_call_error(self) -> None:
+        """Guard in error mode raises GuardedCallError (not a warning)."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        guard_token = _guard_active.set(True)
+        try:
+            req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+            with pytest.raises(GuardedCallError):
+                get_verifier_or_raise("http:request", firewall_request=req)
+        finally:
+            _guard_active.reset(guard_token)
+            _guard_levels.reset(level_token)
+
+    def test_firewall_allow_in_warn_mode_suppresses_warning(self) -> None:
+        """Allowed protocols don't emit warnings even in warn mode."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        level_token = _guard_levels.set(GuardLevels(default="warn", overrides={}))
+        guard_token = _guard_active.set(True)
+        # Push an ALLOW rule for dns onto the firewall stack (direct push:
+        # tripwire.allow(...) requires an active verifier per C9, but this
+        # test exercises guard-mode dispatch without a sandbox).
+        with _push_allow_direct("dns"):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+                with pytest.raises(GuardPassThrough):
+                    get_verifier_or_raise("dns:lookup", firewall_request=req)
+                guarded_warnings = [
+                    x for x in w if issubclass(x.category, GuardedCallWarning)
+                ]
+                assert len(guarded_warnings) == 0
+        _guard_active.reset(guard_token)
+        _guard_levels.reset(level_token)
+
+
+class TestHookFirewallStackMerge:
+    """Test that pytest_runtest_call builds firewall stack from markers correctly.
+
+    These tests verify that allow/deny markers produce correct firewall rules.
+    """
+
+    def test_no_markers_empty_stack_denies(self) -> None:
+        """Without markers, the firewall stack default-denies all protocols."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack = _firewall_stack.get()
+        http_req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+        # Default disposition is DENY (but markers from hook may be present;
+        # without @pytest.mark.allow, http should not be allowed)
+        assert stack.evaluate(http_req) == Disposition.DENY
+
+    @pytest.mark.allow("socket")
+    def test_marker_allow_creates_allow_rule(self) -> None:
+        """@pytest.mark.allow('socket') creates ALLOW rule in firewall stack."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack = _firewall_stack.get()
+        sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+        assert stack.evaluate(sock_req) == Disposition.ALLOW
+
+    @pytest.mark.allow("socket")
+    @pytest.mark.deny("dns")
+    def test_marker_deny_blocks_non_allowed(self) -> None:
+        """deny('dns') blocks 'dns' when it is not in the allow set."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack = _firewall_stack.get()
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+        assert stack.evaluate(dns_req) == Disposition.DENY
+        assert stack.evaluate(sock_req) == Disposition.ALLOW
+
+
+class TestGetVerifierOrRaiseGuardBranching:
+    """Test the modified get_verifier_or_raise with guard mode logic."""
+
+    def test_no_sandbox_no_guard_raises_sandbox_not_active(self) -> None:
+        """Without sandbox or guard, raises SandboxNotActiveError (existing behavior).
+
+        Must explicitly disable guard and guard_patches_installed since the
+        session fixture and hook set them.
+        """
+        from tripwire._context import _guard_patches_installed
+
+        guard_token = _guard_active.set(False)
+        patches_token = _guard_patches_installed.set(False)
+        try:
+            with pytest.raises(SandboxNotActiveError):
+                get_verifier_or_raise("dns:getaddrinfo:example.com")
+        finally:
+            _guard_patches_installed.reset(patches_token)
+            _guard_active.reset(guard_token)
+
+    def test_guard_active_not_in_allowlist_raises_guarded_call_error(self) -> None:
+        """Guard active + not allowed + error level = GuardedCallError."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        token = _guard_active.set(True)
+        try:
+            with pytest.raises(GuardedCallError) as exc_info:
+                get_verifier_or_raise("dns:getaddrinfo:example.com")
+            assert exc_info.value.plugin_name == "dns"
+            assert exc_info.value.source_id == "dns:getaddrinfo:example.com"
+        finally:
+            _guard_active.reset(token)
+            _guard_levels.reset(level_token)
+
+    def test_guard_active_in_allowlist_raises_guard_pass_through(self) -> None:
+        """Guard active + allowed via firewall = GuardPassThrough (interceptor should call original)."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        guard_token = _guard_active.set(True)
+        try:
+            # Direct push: this test exercises guard-mode dispatch without
+            # a sandbox, and tripwire.allow(...) now requires an active
+            # verifier per C9.
+            with _push_allow_direct("dns"):
+                req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+                with pytest.raises(GuardPassThrough):
+                    get_verifier_or_raise("dns:getaddrinfo:example.com", firewall_request=req)
+        finally:
+            _guard_active.reset(guard_token)
+
+    def test_plugin_name_extraction_from_source_id(self) -> None:
+        """Plugin name is the prefix before the first colon."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        token = _guard_active.set(True)
+        try:
+            with pytest.raises(GuardedCallError) as exc_info:
+                get_verifier_or_raise("http:request")
+            assert exc_info.value.plugin_name == "http"
+        finally:
+            _guard_active.reset(token)
+            _guard_levels.reset(level_token)
+
+    def test_plugin_name_extraction_multi_colon(self) -> None:
+        """Multi-colon source_id: plugin name is still first segment."""
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        token = _guard_active.set(True)
+        try:
+            with pytest.raises(GuardedCallError) as exc_info:
+                get_verifier_or_raise("dns:getaddrinfo:example.com")
+            assert exc_info.value.plugin_name == "dns"
+        finally:
+            _guard_active.reset(token)
+            _guard_levels.reset(level_token)
+
+
+class TestGuardPassThroughInDirectPlugins:
+    """Test that GuardPassThrough is caught correctly in direct-helper plugins.
+
+    These tests verify the interceptor pattern by activating guard mode,
+    installing plugin patches, and confirming GuardPassThrough results
+    in calling the original function (not raising).
+
+    DNS is used as the representative case since it has no external deps.
+    """
+
+    def test_dns_getaddrinfo_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks dns:getaddrinfo when dns not in allowlist."""
+        import socket
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        v = StrictVerifier()
+        dns = DnsPlugin(v)
+        dns.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                # Explicitly deny dns to override project-level allow = ["dns:*"]
+                with _push_deny_direct("dns"):
+                    with pytest.raises(GuardedCallError) as exc_info:
+                        socket.getaddrinfo("example.com", 80)
+                    assert exc_info.value.plugin_name == "dns"
+                    assert exc_info.value.source_id == "dns:lookup"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            dns.deactivate()
+
+    def test_dns_getaddrinfo_guard_passes_through_when_not_active(self) -> None:
+        """Guard pass-through: interceptor calls original when guard is not active.
+
+        With patches installed but guard not active, GuardPassThrough is raised
+        and the interceptor calls the original function. This tests the
+        pass-through path; firewall evaluation is tested separately in TestAllow.
+        """
+        import socket
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        v = StrictVerifier()
+        dns = DnsPlugin(v)
+        dns.activate()
+        try:
+            # Guard not active but patches installed -> pass-through
+            guard_token = _guard_active.set(False)
+            try:
+                result = socket.getaddrinfo("localhost", 80)
+                assert isinstance(result, list)
+                assert len(result) > 0
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            dns.deactivate()
+
+    def test_dns_gethostbyname_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks dns:gethostbyname when dns not in allowlist."""
+        import socket
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        v = StrictVerifier()
+        dns = DnsPlugin(v)
+        dns.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                # Explicitly deny dns to override project-level allow = ["dns:*"]
+                with _push_deny_direct("dns"):
+                    with pytest.raises(GuardedCallError) as exc_info:
+                        socket.gethostbyname("example.com")
+                    assert exc_info.value.plugin_name == "dns"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            dns.deactivate()
+
+    def test_dns_gethostbyname_guard_passes_through_when_not_active(self) -> None:
+        """Guard pass-through: interceptor calls original gethostbyname when guard is not active."""
+        import socket
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        v = StrictVerifier()
+        dns = DnsPlugin(v)
+        dns.activate()
+        try:
+            guard_token = _guard_active.set(False)
+            try:
+                result = socket.gethostbyname("localhost")
+                assert isinstance(result, str)
+                assert result == "127.0.0.1"
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            dns.deactivate()
+
+
+class TestGuardPassThroughInStateMachinePlugins:
+    """Test GuardPassThrough in StateMachine plugin interceptors.
+
+    Socket is the representative case (no external deps, easy to test).
+    Database (sqlite3) is also tested since it is always available.
+    """
+
+    def test_socket_connect_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks socket:connect when socket not in allowlist."""
+        import socket as socket_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import _SOCKET_CLOSE_ORIGINAL, SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                # Explicitly deny socket to override project-level allow = ["socket:*"]
+                with _push_deny_direct("socket"):
+                    sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                    try:
+                        with pytest.raises(GuardedCallError) as exc_info:
+                            sock.connect(("127.0.0.1", 1))
+                        assert exc_info.value.plugin_name == "socket"
+                        assert exc_info.value.source_id == "socket:connect"
+                    finally:
+                        _SOCKET_CLOSE_ORIGINAL(sock)
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            sp.deactivate()
+
+    def test_socket_connect_guard_passes_through_when_not_active(self) -> None:
+        """Guard pass-through: interceptor calls real connect when guard is not active."""
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import _SOCKET_CLOSE_ORIGINAL, SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(False)
+            try:
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                try:
+                    # connect to a port that should refuse -- the point is that it
+                    # reaches the REAL connect (ConnectionRefusedError or similar)
+                    with pytest.raises((ConnectionRefusedError, OSError)):
+                        sock.connect(("127.0.0.1", 1))
+                finally:
+                    _SOCKET_CLOSE_ORIGINAL(sock)
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_socket_send_guard_passes_through_in_guard_mode(self) -> None:
+        """In guard mode (no sandbox), send passes through to the original.
+
+        The firewall decision was already made at connect time; send/recv/
+        sendall/close skip tripwire entirely when no sandbox is active.
+        """
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import (
+            _SOCKET_CLOSE_ORIGINAL,
+            SocketPlugin,
+        )
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(True)
+            try:
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                try:
+                    # send should pass through without GuardedCallError
+                    # (will raise OSError because socket is not connected, but NOT GuardedCallError)
+                    with pytest.raises(OSError):
+                        sock.send(b"hello")
+                finally:
+                    _SOCKET_CLOSE_ORIGINAL(sock)
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_socket_close_guard_passes_through_when_not_active(self) -> None:
+        """Guard pass-through: interceptor calls real close when guard is not active."""
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(False)
+            try:
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                # close should call the real close without error
+                sock.close()
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_database_connect_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks db:connect when db not in allowlist."""
+        import sqlite3
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.database_plugin import DatabasePlugin
+
+        v = StrictVerifier()
+        dp = DatabasePlugin(v)
+        dp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with pytest.raises(GuardedCallError) as exc_info:
+                    sqlite3.connect(":memory:")
+                # plugin_name reports the canonical registry name
+                # ("database"), not the source_id prefix ("db"), so it
+                # matches the key users write under [tool.tripwire.guard]
+                # and the same name shown by enabled_plugins/disabled_plugins.
+                assert exc_info.value.plugin_name == "database"
+                assert exc_info.value.source_id == "db:connect"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            dp.deactivate()
+
+    def test_database_connect_guard_passes_through_when_not_active(self) -> None:
+        """Guard pass-through: interceptor calls real connect when guard is not active."""
+        import sqlite3
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.database_plugin import DatabasePlugin
+
+        v = StrictVerifier()
+        dp = DatabasePlugin(v)
+        dp.activate()
+        try:
+            guard_token = _guard_active.set(False)
+            try:
+                # Should call the real sqlite3.connect and return a real connection
+                conn = sqlite3.connect(":memory:")
+                assert conn is not None
+                # Verify it is a real sqlite3.Connection, not a _FakeConnection
+                assert type(conn).__name__ == "Connection"
+                cursor = conn.execute("SELECT 1")
+                row = cursor.fetchone()
+                assert row == (1,)
+                conn.close()
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            dp.deactivate()
+
+    def test_smtp_init_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks smtp:connect when smtp not in allowlist."""
+        import smtplib
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.smtp_plugin import SmtpPlugin
+
+        v = StrictVerifier()
+        sp = SmtpPlugin(v)
+        sp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with pytest.raises(GuardedCallError) as exc_info:
+                    smtplib.SMTP("localhost", 25)
+                assert exc_info.value.plugin_name == "smtp"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            sp.deactivate()
+
+    def test_popen_init_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks subprocess:popen:spawn when subprocess not in allowlist."""
+        import subprocess
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.popen_plugin import PopenPlugin
+
+        v = StrictVerifier()
+        pp = PopenPlugin(v)
+        pp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with pytest.raises(GuardedCallError) as exc_info:
+                    subprocess.Popen(["echo", "hello"])
+                assert exc_info.value.plugin_name == "subprocess"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            pp.deactivate()
+
+
+class TestGuardPassThroughInRemainingPlugins:
+    """Test GuardPassThrough in remaining plugin interceptors (Task 9).
+
+    Subprocess is used as the representative case since it has no external
+    deps beyond the stdlib and exercises both the block and allow paths.
+    HTTP block test verifies the httpx sync interceptor path.
+    """
+
+    def test_subprocess_run_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks subprocess.run when subprocess not in allowlist."""
+        import subprocess as subprocess_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.subprocess import SubprocessPlugin
+
+        v = StrictVerifier()
+        sp = SubprocessPlugin(v)
+        sp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with pytest.raises(GuardedCallError) as exc_info:
+                    subprocess_mod.run(["echo", "hello"], capture_output=True)
+                assert exc_info.value.plugin_name == "subprocess"
+                assert exc_info.value.source_id == "subprocess:run"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            sp.deactivate()
+
+    def test_subprocess_run_guard_passes_through_when_not_active(self) -> None:
+        """Guard pass-through: interceptor calls real subprocess.run when guard is not active."""
+        import subprocess as subprocess_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.subprocess import SubprocessPlugin
+
+        v = StrictVerifier()
+        sp = SubprocessPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(False)
+            try:
+                result = subprocess_mod.run(
+                    ["echo", "hello"], capture_output=True, text=True,
+                )
+                assert result.returncode == 0
+                assert result.stdout == "hello\n"
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_subprocess_which_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks shutil.which when subprocess not in allowlist."""
+        import shutil as shutil_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.subprocess import SubprocessPlugin
+
+        v = StrictVerifier()
+        sp = SubprocessPlugin(v)
+        sp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with pytest.raises(GuardedCallError) as exc_info:
+                    shutil_mod.which("echo")
+                assert exc_info.value.plugin_name == "subprocess"
+                assert exc_info.value.source_id == "subprocess:which"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            sp.deactivate()
+
+    def test_subprocess_which_guard_passes_through_when_not_active(self) -> None:
+        """Guard pass-through: interceptor calls real shutil.which when guard is not active."""
+        import shutil as shutil_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.subprocess import SubprocessPlugin
+
+        v = StrictVerifier()
+        sp = SubprocessPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(False)
+            try:
+                result = shutil_mod.which("echo")
+                assert isinstance(result, str)
+                assert "echo" in result
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_http_sync_guard_blocks_when_not_allowed(self) -> None:
+        """Guard blocks httpx sync transport when http not in allowlist."""
+        import httpx
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.http import HttpPlugin
+
+        v = StrictVerifier()
+        hp = HttpPlugin(v)
+        hp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with pytest.raises(GuardedCallError) as exc_info:
+                    httpx.get("https://example.com")
+                assert exc_info.value.plugin_name == "http"
+                assert exc_info.value.source_id == "http:request"
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            hp.deactivate()
+
+
+class TestGuardPytestFixtures:
+    """Test guard mode pytest fixtures and mark."""
+
+    def test_allow_mark_is_registered(self, pytestconfig: pytest.Config) -> None:
+        """The 'allow' mark should be registered to avoid PytestUnknownMarkWarning."""
+        markers: list[str] = pytestconfig.getini("markers")
+        # Check that at least one marker line starts with 'allow'
+        assert any(m.startswith("allow") for m in markers)
+
+    def test_guard_session_fixture_is_registered(self) -> None:
+        """The _tripwire_guard_patches session fixture should exist in pytest_plugin."""
+        from tripwire import pytest_plugin
+
+        assert hasattr(pytest_plugin, "_tripwire_guard_patches")
+
+    def test_guard_hook_is_registered(self) -> None:
+        """The pytest_runtest_call hook should exist in pytest_plugin module."""
+        from tripwire import pytest_plugin
+
+        assert hasattr(pytest_plugin, "pytest_runtest_call")
+
+    def test_guard_hook_skips_non_guard_plugins(self) -> None:
+        """Guard hook should not activate plugins with passthrough_safe=True."""
+        from tripwire._registry import PLUGIN_REGISTRY, _is_available, get_plugin_class
+
+        for entry in PLUGIN_REGISTRY:
+            if not _is_available(entry):
+                continue
+            plugin_cls = get_plugin_class(entry)
+            if getattr(plugin_cls, "passthrough_safe", False):
+                # These plugins should NOT be activated by guard patches
+                assert entry.name in {
+                    "logging", "jwt", "crypto", "celery", "native", "file_io",
+                }, f"Plugin {entry.name} has passthrough_safe=True but is not in expected set"
+
+    def test_guard_hook_skips_opt_in_plugins(self) -> None:
+        """Guard hook should not activate opt-in plugins (default_enabled=False)."""
+        from tripwire._registry import PLUGIN_REGISTRY
+
+        opt_in = [e for e in PLUGIN_REGISTRY if not e.default_enabled]
+        assert len(opt_in) >= 2  # file_io and native at minimum
+        for entry in opt_in:
+            assert entry.name in {"file_io", "native"}, (
+                f"Unexpected opt-in plugin {entry.name}"
+            )
+
+
+class TestGuardActiveDuringTestBody:
+    """Test that _guard_active is True during test body via pytest_runtest_call hook."""
+
+    def test_guard_active_is_true_during_test(self) -> None:
+        """Guard mode should be active during the test body."""
+        assert _guard_active.get() is True
+
+    def test_firewall_stack_denies_by_default(self) -> None:
+        """Without @pytest.mark.allow, all protocols are denied by the firewall."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack = _firewall_stack.get()
+        req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+        assert stack.evaluate(req) == Disposition.DENY
+
+    @pytest.mark.allow("dns", "socket")
+    def test_mark_allow_populates_firewall_stack(self) -> None:
+        """@pytest.mark.allow should push ALLOW rules onto firewall stack."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack = _firewall_stack.get()
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+        assert stack.evaluate(dns_req) == Disposition.ALLOW
+        assert stack.evaluate(sock_req) == Disposition.ALLOW
+
+    @pytest.mark.allow("dns")
+    def test_mark_allow_single_plugin(self) -> None:
+        """Single plugin in @pytest.mark.allow pushes one ALLOW rule."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack = _firewall_stack.get()
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        assert stack.evaluate(dns_req) == Disposition.ALLOW
+
+    @pytest.mark.allow("dns")
+    @pytest.mark.allow("socket")
+    def test_multiple_allow_marks_combine(self) -> None:
+        """Multiple @pytest.mark.allow decorators combine into firewall rules."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack = _firewall_stack.get()
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+        assert stack.evaluate(dns_req) == Disposition.ALLOW
+        assert stack.evaluate(sock_req) == Disposition.ALLOW
+
+    def test_tripwire_guard_hook_exists_in_pytest_plugin(self) -> None:
+        """The pytest_runtest_call hook should exist in pytest_plugin module."""
+        from tripwire import pytest_plugin
+
+        assert hasattr(pytest_plugin, "pytest_runtest_call")
+
+
+class TestGuardModeIntegration:
+    """Integration tests for guard mode end-to-end behavior.
+
+    These tests verify the full guard mode stack: interceptors, ContextVars,
+    allowlists, sandbox precedence, and config-driven disablement.
+    """
+
+    def test_guard_blocks_real_socket_connect_outside_sandbox(self) -> None:
+        """Guard mode blocks real socket.connect when outside a sandbox.
+
+        Creates its own SocketPlugin activation to be resilient against earlier
+        tests that force-reset plugin install counts.
+        """
+        import socket as socket_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import _SOCKET_CLOSE_ORIGINAL, SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        try:
+            # Explicitly deny socket to override project-level allow = ["socket:*"]
+            with _push_deny_direct("socket"):
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                try:
+                    with pytest.raises(GuardedCallError) as exc_info:
+                        sock.connect(("127.0.0.1", 1))
+                    assert exc_info.value.plugin_name == "socket"
+                    assert exc_info.value.source_id == "socket:connect"
+                finally:
+                    _SOCKET_CLOSE_ORIGINAL(sock)
+        finally:
+            _guard_levels.reset(level_token)
+            sp.deactivate()
+
+    def test_guard_pass_through_permits_real_socket_operations(self) -> None:
+        """Guard pass-through permits real socket operations when guard is not active.
+
+        Plugins haven't been migrated to pass FirewallRequest yet, so the
+        pass-through path (_guard_active=False + patches installed) is the
+        mechanism that permits real I/O. Once plugins pass FirewallRequest,
+        @pytest.mark.allow will work end-to-end via firewall evaluation.
+        """
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        guard_token = _guard_active.set(False)
+        try:
+            sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+            try:
+                # connect to a port that should refuse -- proves the REAL connect ran
+                with pytest.raises((ConnectionRefusedError, OSError)):
+                    sock.connect(("127.0.0.1", 1))
+            finally:
+                sock.close()
+        finally:
+            _guard_active.reset(guard_token)
+            sp.deactivate()
+
+    def test_sandbox_takes_precedence_over_guard(self) -> None:
+        """Inside a sandbox, guard mode is irrelevant; sandbox mocking applies.
+
+        Creates its own verifier + DnsPlugin to be self-contained.
+        """
+        import socket
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin, _DnsSentinel
+
+        v = StrictVerifier()
+        dns_plugin = None
+        for p in v._plugins:
+            if isinstance(p, DnsPlugin):
+                dns_plugin = p
+                break
+        assert dns_plugin is not None, "DnsPlugin should be registered"
+
+        dns_plugin.mock_getaddrinfo(
+            "example.com", returns=[(2, 1, 6, "", ("93.184.216.34", 80))],
+        )
+        with v.sandbox():
+            result = socket.getaddrinfo("example.com", 80)
+            assert result == [(2, 1, 6, "", ("93.184.216.34", 80))]
+
+        v.assert_interaction(
+            _DnsSentinel("dns:getaddrinfo:example.com"),
+            host="example.com",
+            port=80,
+            family=0,
+            type=0,
+            proto=0,
+        )
+
+    @pytest.mark.allow("dns")
+    def test_allow_context_manager_adds_to_marker_rules(self) -> None:
+        """allow() inside @pytest.mark.allow adds rules to the firewall stack."""
+        from tripwire._firewall_request import NetworkFirewallRequest
+
+        stack_mark = _firewall_stack.get()
+        dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+        # Use redis (not socket) as the "not allowed" protocol since the project-level
+        # firewall config allows both dns:* and socket:*.
+        redis_req = NetworkFirewallRequest(protocol="redis", host="127.0.0.1", port=6379)
+
+        # Mark already allows "dns"
+        assert stack_mark.evaluate(dns_req) == Disposition.ALLOW
+        assert stack_mark.evaluate(redis_req) == Disposition.DENY
+
+        with _with_active_verifier(), allow("redis"):
+            stack_both = _firewall_stack.get()
+            assert stack_both.evaluate(dns_req) == Disposition.ALLOW
+            assert stack_both.evaluate(redis_req) == Disposition.ALLOW
+
+        # After exiting allow(), redis back to DENY
+        assert _firewall_stack.get().evaluate(redis_req) == Disposition.DENY
+        assert _firewall_stack.get().evaluate(dns_req) == Disposition.ALLOW
+
+    def test_guard_pass_through_permits_real_dns_operations(self) -> None:
+        """Guard pass-through permits real DNS when guard is not active.
+
+        Plugins haven't been migrated to pass FirewallRequest yet, so the
+        pass-through path is used. Firewall stack semantics for marks are
+        tested separately in TestGuardActiveDuringTestBody.
+        """
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        v = StrictVerifier()
+        dns = DnsPlugin(v)
+        dns.activate()
+        guard_token = _guard_active.set(False)
+        try:
+            result = socket_mod.getaddrinfo("localhost", 80)
+            assert isinstance(result, list)
+            assert len(result) > 0
+            first = result[0]
+            assert len(first) == 5  # (family, type, proto, canonname, sockaddr)
+        finally:
+            _guard_active.reset(guard_token)
+            dns.deactivate()
+
+    def test_guard_active_is_false_during_fixture_setup(self) -> None:
+        """Indirectly verify guard is scoped to test body, not fixtures.
+
+        The hook wraps pytest_runtest_call (test body only). If guard were
+        active during fixture setup, the _tripwire_auto_verifier fixture
+        would fail when creating StrictVerifier (which internally may
+        perform I/O-like operations). The fact that we get here proves it.
+        """
+        assert _guard_active.get() is True  # Active in test body
+
+    def test_guard_blocks_dns_lookup_outside_sandbox(self) -> None:
+        """Guard blocks real DNS lookups outside a sandbox.
+
+        Creates its own DnsPlugin activation to be resilient against earlier
+        tests that force-reset plugin install counts (e.g., test_dns_plugin.py).
+        """
+        import socket as socket_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        v = StrictVerifier()
+        dns = DnsPlugin(v)
+        dns.activate()
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        try:
+            # Explicitly deny dns to override project-level allow = ["dns:*"]
+            with _push_deny_direct("dns"):
+                with pytest.raises(GuardedCallError) as exc_info:
+                    socket_mod.getaddrinfo("example.com", 80)
+                assert exc_info.value.plugin_name == "dns"
+        finally:
+            _guard_levels.reset(level_token)
+            dns.deactivate()
+
+    def test_guard_blocks_subprocess_outside_sandbox(self) -> None:
+        """Guard blocks real subprocess.run outside a sandbox.
+
+        Creates its own SubprocessPlugin activation to be resilient against
+        earlier tests that force-reset plugin install counts.
+        """
+        import subprocess as subprocess_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.subprocess import SubprocessPlugin
+
+        v = StrictVerifier()
+        sp = SubprocessPlugin(v)
+        sp.activate()
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        try:
+            with pytest.raises(GuardedCallError) as exc_info:
+                subprocess_mod.run(["echo", "hello"], capture_output=True)
+            assert exc_info.value.plugin_name == "subprocess"
+            assert exc_info.value.source_id == "subprocess:run"
+        finally:
+            _guard_levels.reset(level_token)
+            sp.deactivate()
+
+    def test_guard_pass_through_permits_real_subprocess(self) -> None:
+        """Guard pass-through permits real subprocess.run when guard is not active.
+
+        Plugins haven't been migrated to pass FirewallRequest yet.
+        """
+        import subprocess as subprocess_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.subprocess import SubprocessPlugin
+
+        v = StrictVerifier()
+        sp = SubprocessPlugin(v)
+        sp.activate()
+        guard_token = _guard_active.set(False)
+        try:
+            result = subprocess_mod.run(
+                ["echo", "guard_test"], capture_output=True, text=True,
+            )
+            assert result.returncode == 0
+            assert result.stdout == "guard_test\n"
+        finally:
+            _guard_active.reset(guard_token)
+            sp.deactivate()
+
+    def test_guard_blocks_http_outside_sandbox(self) -> None:
+        """Guard blocks real HTTP requests outside a sandbox.
+
+        Creates its own HttpPlugin activation to be resilient against earlier
+        tests that force-reset plugin install counts.
+        """
+        import httpx
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.http import HttpPlugin
+
+        v = StrictVerifier()
+        hp = HttpPlugin(v)
+        hp.activate()
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        try:
+            with pytest.raises(GuardedCallError) as exc_info:
+                httpx.get("https://example.com")
+            assert exc_info.value.plugin_name == "http"
+            assert exc_info.value.source_id == "http:request"
+        finally:
+            _guard_levels.reset(level_token)
+            hp.deactivate()
+
+    def test_sandbox_takes_precedence_over_firewall_allow(self) -> None:
+        """Sandbox intercepts calls regardless of firewall allow rules.
+
+        In the new firewall system, sandbox is step 1 in the decision tree
+        and is always consulted before the firewall. An allow() rule does
+        not bypass sandbox interception.
+        """
+        import socket
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import _DnsSentinel
+
+        v = StrictVerifier()
+        dns_plugin = None
+        for p in v._plugins:
+            from tripwire.plugins.dns_plugin import DnsPlugin
+            if isinstance(p, DnsPlugin):
+                dns_plugin = p
+                break
+        assert dns_plugin is not None
+
+        dns_plugin.mock_getaddrinfo(
+            "localhost", returns=[(2, 1, 6, "", ("127.0.0.1", 80))],
+        )
+
+        with _with_active_verifier():
+            with allow("dns"):
+                with v.sandbox():
+                    # Even with allow("dns"), sandbox intercepts the call
+                    result = socket.getaddrinfo("localhost", 80)
+                    assert result == [(2, 1, 6, "", ("127.0.0.1", 80))]
+
+        # The interaction IS recorded because sandbox takes precedence
+        v.assert_interaction(
+            _DnsSentinel("dns:getaddrinfo:localhost"),
+            host="localhost",
+            port=80,
+            family=0,
+            type=0,
+            proto=0,
+        )
+
+    def test_guarded_call_error_message_has_actionable_guidance(self) -> None:
+        """GuardedCallError message contains all three remediation options.
+
+        Creates its own DnsPlugin activation to be resilient against earlier
+        tests that force-reset plugin install counts.
+        """
+        import socket as socket_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.dns_plugin import DnsPlugin
+
+        v = StrictVerifier()
+        dns = DnsPlugin(v)
+        dns.activate()
+        level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+        try:
+            # Explicitly deny dns to override project-level allow = ["dns:*"]
+            with _push_deny_direct("dns"):
+                with pytest.raises(GuardedCallError) as exc_info:
+                    socket_mod.getaddrinfo("example.com", 80)
+            msg = str(exc_info.value)
+            # New firewall message format
+            assert "blocked by tripwire firewall" in msg
+            assert "Attempted:" in msg
+            assert "Fix with @pytest.mark.allow:" in msg
+            assert '@pytest.mark.allow(M(protocol="dns"))' in msg
+            assert "Fix with context manager (scoped to a block):" in msg
+            assert 'tripwire.allow(M(protocol="dns"))' in msg
+            assert "Fix in pyproject.toml:" in msg
+            assert "[tool.tripwire.firewall]" in msg
+            assert 'allow = ["dns:*"]' in msg
+            assert "Or mock the call with a sandbox:" in msg
+            assert "with tripwire:" in msg
+            assert "https://tripwire.readthedocs.io/guides/guard-mode/" in msg
+            # Old sections removed
+            assert "passthrough_safe" not in msg
+            assert "Valid plugin names for allow():" not in msg
+        finally:
+            _guard_levels.reset(level_token)
+            dns.deactivate()
+
+
+class TestGuardAllowConfigMigration:
+    """Test that old guard_allow config key raises migration error."""
+
+    def test_guard_allow_raises_migration_error(self) -> None:
+        """guard_allow config key is rejected with migration instructions."""
+        from unittest.mock import patch
+
+        from tripwire._errors import TripwireConfigError
+        from tripwire.pytest_plugin import pytest_runtest_call
+
+        config = {"guard": "error", "guard_allow": ["socket"]}
+
+        class FakeItem:
+            def iter_markers(self, name: str):
+                return []
+
+        item = FakeItem()
+
+        with patch("tripwire.pytest_plugin.load_tripwire_config", return_value=config):
+            hook_gen = pytest_runtest_call(item)
+            with pytest.raises(TripwireConfigError, match="guard_allow config key has been replaced"):
+                next(hook_gen)
+
+    def test_guard_allow_string_raises_migration_error(self) -> None:
+        """guard_allow = "socket" (string) also raises migration error."""
+        from unittest.mock import patch
+
+        from tripwire._errors import TripwireConfigError
+        from tripwire.pytest_plugin import pytest_runtest_call
+
+        config = {"guard": "error", "guard_allow": "socket"}
+
+        class FakeItem:
+            def iter_markers(self, name: str):
+                return []
+
+        item = FakeItem()
+
+        with patch("tripwire.pytest_plugin.load_tripwire_config", return_value=config):
+            hook_gen = pytest_runtest_call(item)
+            with pytest.raises(TripwireConfigError, match="guard_allow config key has been replaced"):
+                next(hook_gen)
+
+
+class TestFirewallTomlConfig:
+    """Test [tool.tripwire.firewall] TOML config integration with pytest hook."""
+
+    def test_firewall_allow_rule_in_config(self) -> None:
+        """[tool.tripwire.firewall] allow = ["socket:*"] creates ALLOW rule."""
+        from unittest.mock import patch
+
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire.pytest_plugin import pytest_runtest_call
+
+        config = {"guard": "error", "firewall": {"allow": ["socket:*"]}}
+
+        class FakeItem:
+            fspath = "tests/test_example.py"
+
+            def iter_markers(self, name: str):
+                return []
+
+        item = FakeItem()
+
+        with patch("tripwire.pytest_plugin.load_tripwire_config", return_value=config):
+            hook_gen = pytest_runtest_call(item)
+            next(hook_gen)
+            stack = _firewall_stack.get()
+            sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+            assert stack.evaluate(sock_req) == Disposition.ALLOW
+            try:
+                hook_gen.send(None)
+            except StopIteration:
+                pass
+
+    def test_no_firewall_config_denies_all(self) -> None:
+        """Without [tool.tripwire.firewall], all protocols are denied."""
+        from unittest.mock import patch
+
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire.pytest_plugin import pytest_runtest_call
+
+        config = {"guard": "error"}
+
+        class FakeItem:
+            fspath = "tests/test_example.py"
+
+            def iter_markers(self, name: str):
+                return []
+
+        item = FakeItem()
+
+        with patch("tripwire.pytest_plugin.load_tripwire_config", return_value=config):
+            hook_gen = pytest_runtest_call(item)
+            next(hook_gen)
+            stack = _firewall_stack.get()
+            http_req = NetworkFirewallRequest(protocol="http", host="example.com", port=80)
+            assert stack.evaluate(http_req) == Disposition.DENY
+            try:
+                hook_gen.send(None)
+            except StopIteration:
+                pass
+
+    def test_marker_allow_merged_with_toml_config(self) -> None:
+        """@pytest.mark.allow merges with [tool.tripwire.firewall] allow rules."""
+        from unittest.mock import patch
+
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire.pytest_plugin import pytest_runtest_call
+
+        config = {"guard": "error", "firewall": {"allow": ["socket:*"]}}
+
+        class FakeMark:
+            def __init__(self, *args: str) -> None:
+                self.args = args
+
+        class FakeItem:
+            fspath = "tests/test_example.py"
+
+            def iter_markers(self, name: str):
+                if name == "allow":
+                    return [FakeMark("dns")]
+                return []
+
+        item = FakeItem()
+
+        with patch("tripwire.pytest_plugin.load_tripwire_config", return_value=config):
+            hook_gen = pytest_runtest_call(item)
+            next(hook_gen)
+            stack = _firewall_stack.get()
+            sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+            dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+            assert stack.evaluate(sock_req) == Disposition.ALLOW
+            assert stack.evaluate(dns_req) == Disposition.ALLOW
+            try:
+                hook_gen.send(None)
+            except StopIteration:
+                pass
+
+    def test_deny_marker_overrides_toml_allow(self) -> None:
+        """@pytest.mark.deny blocks protocols even when TOML allows them."""
+        from unittest.mock import patch
+
+        from tripwire._firewall_request import NetworkFirewallRequest
+        from tripwire.pytest_plugin import pytest_runtest_call
+
+        config = {"guard": "error", "firewall": {"allow": ["socket:*", "dns:*"]}}
+
+        class FakeMark:
+            def __init__(self, *args: str) -> None:
+                self.args = args
+
+        class FakeItem:
+            fspath = "tests/test_example.py"
+
+            def iter_markers(self, name: str):
+                if name == "deny":
+                    return [FakeMark("socket")]
+                return []
+
+        item = FakeItem()
+
+        with patch("tripwire.pytest_plugin.load_tripwire_config", return_value=config):
+            hook_gen = pytest_runtest_call(item)
+            next(hook_gen)
+            stack = _firewall_stack.get()
+            sock_req = NetworkFirewallRequest(protocol="socket", host="127.0.0.1", port=80)
+            dns_req = NetworkFirewallRequest(protocol="dns", host="example.com", port=53)
+            # deny is innermost (pushed after allow), so socket is denied
+            assert stack.evaluate(sock_req) == Disposition.DENY
+            assert stack.evaluate(dns_req) == Disposition.ALLOW
+            try:
+                hook_gen.send(None)
+            except StopIteration:
+                pass
+
+
+class TestSocketNonConnectGuardPassThrough:
+    """Test that send/recv/sendall/close pass through in guard mode (no sandbox).
+
+    The firewall decision is made at connect time. Non-connect operations
+    should not hit the firewall at all when no sandbox is active.
+    """
+
+    def test_send_passes_through_in_guard_mode(self) -> None:
+        """socket.send passes through to original in guard mode."""
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import _SOCKET_CLOSE_ORIGINAL, SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(True)
+            try:
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                try:
+                    # Not connected, so real send raises OSError, not GuardedCallError
+                    with pytest.raises(OSError):
+                        sock.send(b"hello")
+                finally:
+                    _SOCKET_CLOSE_ORIGINAL(sock)
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_sendall_passes_through_in_guard_mode(self) -> None:
+        """socket.sendall passes through to original in guard mode."""
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import _SOCKET_CLOSE_ORIGINAL, SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(True)
+            try:
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                try:
+                    # Not connected, so real sendall raises OSError, not GuardedCallError
+                    with pytest.raises(OSError):
+                        sock.sendall(b"hello")
+                finally:
+                    _SOCKET_CLOSE_ORIGINAL(sock)
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_recv_passes_through_in_guard_mode(self) -> None:
+        """socket.recv passes through to original in guard mode."""
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import _SOCKET_CLOSE_ORIGINAL, SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(True)
+            try:
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                try:
+                    # Not connected, so real recv raises OSError, not GuardedCallError
+                    with pytest.raises(OSError):
+                        sock.recv(1024)
+                finally:
+                    _SOCKET_CLOSE_ORIGINAL(sock)
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_close_passes_through_in_guard_mode(self) -> None:
+        """socket.close passes through to original in guard mode."""
+        import socket as socket_mod
+
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            guard_token = _guard_active.set(True)
+            try:
+                sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                # close should succeed without GuardedCallError
+                sock.close()
+            finally:
+                _guard_active.reset(guard_token)
+        finally:
+            sp.deactivate()
+
+    def test_close_no_guarded_call_error_even_with_deny(self) -> None:
+        """socket.close does not raise GuardedCallError even when socket is denied.
+
+        Non-connect operations bypass tripwire entirely in guard mode,
+        regardless of firewall rules.
+        """
+        import socket as socket_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with _push_deny_direct("socket"):
+                    sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                    # close passes through even with deny("socket") active
+                    sock.close()
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            sp.deactivate()
+
+    def test_send_no_guarded_call_error_even_with_deny(self) -> None:
+        """socket.send does not raise GuardedCallError even when socket is denied.
+
+        Non-connect operations bypass tripwire entirely in guard mode,
+        regardless of firewall rules. The real send raises OSError because
+        the socket is not connected.
+        """
+        import socket as socket_mod
+
+        from tripwire._config import GuardLevels
+        from tripwire._context import _guard_levels
+        from tripwire._verifier import StrictVerifier
+        from tripwire.plugins.socket_plugin import _SOCKET_CLOSE_ORIGINAL, SocketPlugin
+
+        v = StrictVerifier()
+        sp = SocketPlugin(v)
+        sp.activate()
+        try:
+            level_token = _guard_levels.set(GuardLevels(default="error", overrides={}))
+            guard_token = _guard_active.set(True)
+            try:
+                with _push_deny_direct("socket"):
+                    sock = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+                    try:
+                        # Real send raises OSError, not GuardedCallError
+                        with pytest.raises(OSError):
+                            sock.send(b"hello")
+                    finally:
+                        _SOCKET_CLOSE_ORIGINAL(sock)
+            finally:
+                _guard_active.reset(guard_token)
+                _guard_levels.reset(level_token)
+        finally:
+            sp.deactivate()

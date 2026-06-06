@@ -1,0 +1,214 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-tripwire"
+version = "0.21.0"
+description = "Full-certainty test mocking: every call recorded and verified"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+keywords = ["testing", "mocking", "http", "verification", "pytest", "assertions", "test-doubles", "integration-testing", "subprocess", "database", "websocket", "redis", "smtp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Testing :: Mocking",
+    "Topic :: Software Development :: Quality Assurance",
+    "Framework :: Pytest",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "tomli>=1.1.0; python_version < '3.11'",
+    "exceptiongroup>=1.0.0; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/MisganaTsegaye/pytest-tripwire"
+Repository = "https://github.com/MisganaTsegaye/pytest-tripwire"
+Issues = "https://github.com/MisganaTsegaye/pytest-tripwire/issues"
+Changelog = "https://github.com/MisganaTsegaye/pytest-tripwire/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+http = [
+    "httpx>=0.25.0",
+    "requests>=2.31.0",
+    "types-requests>=2.31.0",
+]
+matchers = [
+    "dirty-equals>=0.7.0",
+]
+websockets = [
+    "websockets>=13.0",
+]
+"websocket-client" = [
+    "websocket-client>=1.7.0",
+]
+redis = [
+    "redis>=5.0.0",
+]
+aiohttp = [
+    "aiohttp>=3.9.0",
+]
+psycopg2 = [
+    "psycopg2-binary>=2.9.0",
+]
+asyncpg = [
+    "asyncpg>=0.29.0",
+]
+boto3 = [
+    "boto3>=1.28.0",
+]
+pika = [
+    "pika>=1.3.0",
+]
+celery = [
+    "celery>=5.3.0",
+]
+grpc = [
+    "grpcio>=1.60.0",
+]
+pymemcache = [
+    "pymemcache>=4.0.0",
+]
+pymongo = [
+    "pymongo>=4.6.0",
+]
+cffi = [
+    "cffi>=1.16.0",
+]
+jwt = [
+    "PyJWT>=2.8.0",
+]
+crypto = [
+    "cryptography>=41.0.0",
+]
+elasticsearch = [
+    "elasticsearch>=8.12.0",
+]
+dnspython = [
+    "dnspython>=2.6.0",
+]
+paramiko = [
+    "paramiko>=3.4.0",
+]
+mcp = [
+    "mcp>=1.0.0",
+]
+all = [
+    "pytest-tripwire[http,matchers,websockets,websocket-client,redis,aiohttp,psycopg2,asyncpg,boto3,pika,celery,grpc,pymemcache,pymongo,cffi,jwt,crypto,elasticsearch,dnspython,paramiko,mcp]",
+]
+all-ft = [
+    "pytest-tripwire[http,matchers,websockets,websocket-client,redis,boto3,jwt,dnspython,pymemcache,elasticsearch]",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+    "mike>=2.1",
+]
+dev = [
+    "pytest-tripwire[all,docs]",
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "mypy>=1.7.0",
+    "ruff>=0.1.0",
+]
+dev-ft = [
+    "pytest-tripwire[all-ft]",
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.entry-points."pytest11"]
+tripwire = "tripwire.pytest_plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tripwire"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "examples"]
+asyncio_mode = "auto"
+markers = [
+    "slow: tests that take >5 seconds",
+    "integration: tests requiring real subsystem activation",
+    "network: tests that would make real network calls (should all be intercepted by tripwire)",
+]
+
+[tool.coverage.run]
+source_pkgs = ["tripwire"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+    "\\.\\.\\.",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = [
+    "celery",
+    "celery.*",
+    "botocore",
+    "botocore.*",
+    "paramiko",
+    "paramiko.*",
+    "pika",
+    "pika.*",
+    "cffi",
+    "cffi.*",
+    "grpc",
+    "grpc.*",
+    "pymemcache",
+    "pymemcache.*",
+    "tomli",
+    "exceptiongroup",
+]
+ignore_missing_imports = true
+
+[tool.tripwire.firewall]
+allow = ["dns:*", "socket:*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "ANN"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "ANN401",   # Any is acceptable in test stubs and helpers
+    "E501",     # Long lines are acceptable in ESCAPE/MUTATION analysis comments
+    "F811",     # Intentional redefinition patterns (e.g., ConcretePlugin stub then real)
+    "E402",     # Imports after pytest.importorskip() are intentional
+    "ANN001",   # Missing arg annotations in test-only helpers
+    "ANN201",   # Missing return annotations in test fixtures
+    "ANN202",   # Missing return annotations in private test helpers
+    "F841",     # Local variable assigned but unused (e.g., importorskip result used for skip)
+]
+"examples/**/*.py" = [
+    "ANN001",   # Missing arg annotations in example code
+    "ANN201",   # Missing return annotations in example tests
+    "ANN202",   # Missing return annotations in example fixtures
+]

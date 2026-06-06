@@ -1,0 +1,39 @@
+"""Test boto3 S3 upload with SQS notification using tripwire boto3_mock."""
+
+import logging
+
+import pytest
+
+import tripwire
+
+from .app import upload_and_notify
+
+
+@pytest.fixture(autouse=True)
+def _silence_botocore():
+    """Suppress botocore DEBUG logs that would generate dozens of LoggingPlugin interactions."""
+    for name in ("botocore", "boto3", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def test_upload_and_notify():
+    tripwire.boto3.mock_call("s3", "PutObject", returns={})
+    tripwire.boto3.mock_call("sqs", "SendMessage", returns={"MessageId": "msg-001"})
+
+    with tripwire:
+        upload_and_notify(
+            "data-bucket", "reports/q1.csv", b"revenue,100",
+            "https://sqs.us-east-1.amazonaws.com/123/notifications",
+        )
+
+    tripwire.boto3.assert_boto3_call(
+        service="s3", operation="PutObject",
+        params={"Bucket": "data-bucket", "Key": "reports/q1.csv", "Body": b"revenue,100"},
+    )
+    tripwire.boto3.assert_boto3_call(
+        service="sqs", operation="SendMessage",
+        params={
+            "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123/notifications",
+            "MessageBody": "Uploaded reports/q1.csv",
+        },
+    )
